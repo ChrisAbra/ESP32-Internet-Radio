@@ -7,9 +7,9 @@
 using namespace std;
 
 // ESP32 I2S digital output pins
-#define I2S_DOUT 25   // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
-#define I2S_BCLK 26   // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
-#define I2S_LRC 27    // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
+#define I2S_DOUT 25 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
+#define I2S_BCLK 26 // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
+#define I2S_LRC 27  // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
 
 #define USE_MONO true // Use mono audio
 
@@ -33,7 +33,7 @@ class Radio
 {
 private:
   int _volumePercentage = 100;
-  char* _accessPointName;
+  char *_accessPointName;
   WiFiManager _wifiManager;
   bool _hasWifiConnection;
   MODE _currentMode;
@@ -79,7 +79,7 @@ private:
   }
 
 public:
-  Radio(char* accessPointName, int BCLK_PIN, int LRC_PIN, int DOUT_PIN)
+  Radio(char *accessPointName, int BCLK_PIN, int LRC_PIN, int DOUT_PIN)
   {
 
     _BCLK_PIN = BCLK_PIN;
@@ -188,8 +188,8 @@ public:
     if (_currentMode == MODE::RADIO)
     {
       _radioAudio.loop();
-      vTaskDelay(1);
     }
+    vTaskDelay(1);
   }
 };
 
@@ -201,7 +201,6 @@ Radio radio(DEVICE_NAME, I2S_BCLK, I2S_LRC, I2S_DOUT);
 
 void setup()
 {
-
 }
 
 void loop()

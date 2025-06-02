@@ -7,175 +7,201 @@
 using namespace std;
 
 // ESP32 I2S digital output pins
-#define I2S_DOUT 25 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
-#define I2S_BCLK 26 // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
-#define I2S_LRC 27  // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
+#define I2S_DOUT 25   // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
+#define I2S_BCLK 26   // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
+#define I2S_LRC 27    // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
 
-string deviceName = "Rams RT-20 Radio";
+#define USE_MONO true // Use mono audio
 
-btAudio bluetoothAudio = btAudio(deviceName.c_str());
-Audio radioAudio;
+char* DEVICE_NAME = "Rams RT-20 Radio";
 
-enum MODE
+enum class MODE
 {
+  OFF,
   BLUETOOTH,
   RADIO,
   INVALID
 };
 
-MODE currentMode = RADIO;
-bool useMono = true;
-
-int volumePercentage = 100;
-int currentRadioChannel = 1;
-
-string channels[4] = {
+string CHANNELS[4] = {
     "https://stream-relay-geo.ntslive.net/stream",
     "https://stream-relay-geo.ntslive.net/stream2",
     "https://stream-relay-geo.ntslive.net/stream3",
     "https://stream-mixtape-geo.ntslive.net/mixtape"};
 
-WiFiManager wifiManager;
-bool hasWifiConnection = false;
-
-
-
-void setVolume()
+class Radio
 {
-  if (currentMode == BLUETOOTH)
-  {
-    bluetoothAudio.volume(volumePercentage / 100.0f);
-  }
-  else if (currentMode == RADIO)
-  {
-    radioAudio.setVolume(volumePercentage);
-  }
-}
+private:
+  int _volumePercentage = 100;
+  char* _accessPointName;
+  WiFiManager _wifiManager;
+  bool _hasWifiConnection;
+  MODE _currentMode;
 
-void enterRadioMode()
-{
-  if (currentMode == RADIO)
-  {
-    return;
-  }
+  Audio _radioAudio;
+  string _playingRadioStream;
 
-  radioAudio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  radioAudio.forceMono(useMono); // Force mono for single speaker;
-  setVolume();
-  currentMode = RADIO;
-}
+  btAudio _bluetoothAudio = btAudio("ESP32 Bluetooth Device");
 
-void exitRadioMode()
-{
-  // radioAudio.setPinout(I2S_LRC + 1, I2S_LRC + 2, I2S_LRC + 3); // move off the I2S pins;
-  currentMode = INVALID;
-}
+  int _BCLK_PIN, _LRC_PIN, _DOUT_PIN;
 
-void enterBluetoothMode()
-{
-  if (currentMode == BLUETOOTH)
+  void _initialiseBluetooth(bool reconnect = false)
   {
-    return;
-  }
-  bluetoothAudio.begin();
-  bluetoothAudio.reconnect(); // Re-connects to last connected device
-  bluetoothAudio.I2S(I2S_BCLK, I2S_DOUT, I2S_LRC);
-  setVolume();
-  currentMode = BLUETOOTH;
-}
-
-void disconnectBluetooth()
-{
-  if (currentMode != BLUETOOTH)
-  {
-    return;
-  }
-  if (bluetoothAudio.hasClient)
-  {
-    bluetoothAudio.disconnect();
-  }
-}
-
-void exitBluetoothMode()
-{
-  if (currentMode != BLUETOOTH)
-  {
-    return;
-  }
-  bluetoothAudio.end();
-  currentMode = INVALID;
-}
-
-bool changeMode(MODE newMode)
-{
-  if (currentMode == newMode)
-  {
-    return true;
-  }
-  // exit current mode
-  if (currentMode == BLUETOOTH)
-  {
-    disconnectBluetooth();
-    exitBluetoothMode();
-  }
-  else if (currentMode == RADIO)
-  {
-    exitRadioMode();
-  }
-  // enter new mode
-  if (newMode == BLUETOOTH)
-  {
-    enterBluetoothMode();
-  }
-  else if (newMode == RADIO)
-  {
-    if (!hasWifiConnection)
+    _bluetoothAudio.begin();
+    if (reconnect)
     {
+      _bluetoothAudio.reconnect(); // Re-connects to last connected device
+    }
+    _bluetoothAudio.I2S(_BCLK_PIN, _DOUT_PIN, _LRC_PIN);
+    _bluetoothAudio.volume(_volumePercentage / 100.0f);
+    _currentMode = MODE::BLUETOOTH;
+  }
+  void _stopBluetooth()
+  {
+    Serial.println("Stopping bluetooth");
+  }
+
+  void _startRadio()
+  {
+    _radioAudio.setPinout(_BCLK_PIN, _LRC_PIN, _DOUT_PIN);
+    _radioAudio.forceMono(USE_MONO); // Force mono for single speaker;
+    _radioAudio.setVolume(_volumePercentage);
+    _currentMode = MODE::RADIO;
+    Serial.println("Starting radio");
+  }
+
+  void _stopRadio()
+  {
+    if (_radioAudio.isRunning())
+    {
+      _radioAudio.stopSong();
+    }
+  }
+
+public:
+  Radio(char* accessPointName, int BCLK_PIN, int LRC_PIN, int DOUT_PIN)
+  {
+
+    _BCLK_PIN = BCLK_PIN;
+    _LRC_PIN = LRC_PIN;
+    _DOUT_PIN = DOUT_PIN;
+
+    _currentMode = MODE::OFF;
+    _accessPointName = accessPointName;
+    _bluetoothAudio = btAudio(accessPointName);
+
+    _wifiManager.setConfigPortalTimeout(180);
+    _hasWifiConnection = _wifiManager.autoConnect(accessPointName);
+  }
+
+  bool playRadioStream(string newChannelStream)
+  {
+    if (_playingRadioStream == newChannelStream)
+    {
+      Serial.println("Already connected to stream");
+      return true;
+    }
+
+    if (!_hasWifiConnection)
+    {
+      Serial.println("Cannot play stream as no valid wifi connection");
       return false;
     }
-    enterRadioMode();
+
+    if (_currentMode == MODE::BLUETOOTH)
+    {
+      _stopBluetooth();
+    }
+
+    _startRadio();
+    Serial.println("Connecting to new stream:");
+    Serial.println(newChannelStream.c_str());
+    return _radioAudio.connecttohost(newChannelStream.c_str());
   }
 
-  return true;
-}
-
-void connectToChannel(int newChannel)
-{
-  if (currentMode == RADIO && currentRadioChannel == newChannel)
+  void playBluetooth()
   {
-    return;
+    if (_currentMode == MODE::BLUETOOTH)
+    {
+      return;
+    }
+    if (_currentMode == MODE::RADIO)
+    {
+      _stopRadio();
+    }
+    _initialiseBluetooth(true);
   }
 
-  if (changeMode(RADIO))
+  void enableBluetoothPairingMode()
   {
-    currentRadioChannel = newChannel;
-    radioAudio.connecttohost(channels[currentRadioChannel].c_str());
+    if (_bluetoothAudio.hasClient)
+    {
+      _bluetoothAudio.disconnect();
+      _bluetoothAudio.end();
+    }
+    _initialiseBluetooth(false);
   }
-}
 
+  void enableWifiPairingMode()
+  {
+    _hasWifiConnection = _wifiManager.startConfigPortal(_accessPointName);
+  }
+
+  bool hasWifiConnection()
+  {
+    return _hasWifiConnection;
+  }
+
+  void setVolume(int newVolumePercentage)
+  {
+    if (newVolumePercentage == _volumePercentage)
+    {
+      return;
+    }
+    _volumePercentage = newVolumePercentage;
+
+    if (_currentMode == MODE::BLUETOOTH)
+    {
+      _bluetoothAudio.volume(_volumePercentage / 100.0f);
+    }
+    else if (_currentMode == MODE::RADIO)
+    {
+      _radioAudio.setVolume(_volumePercentage);
+    }
+  }
+
+  void stop()
+  {
+    if (_currentMode == MODE::RADIO)
+    {
+      _stopRadio();
+    }
+    else if (_currentMode == MODE::BLUETOOTH)
+    {
+      _stopBluetooth();
+    }
+    _currentMode == MODE::OFF;
+  }
+
+  void loop()
+  {
+    if (_currentMode == MODE::RADIO)
+    {
+      _radioAudio.loop();
+      vTaskDelay(1);
+    }
+  }
+};
 
 void checkButtons() {}
 
 void checkPots() {}
 
-void loopRadio()
-{
-  radioAudio.loop();
-  vTaskDelay(1);
-}
+Radio radio(DEVICE_NAME, I2S_BCLK, I2S_LRC, I2S_DOUT);
 
 void setup()
 {
-  wifiManager.setConfigPortalTimeout(180);
-  hasWifiConnection = wifiManager.autoConnect(deviceName.c_str());
 
-  if (!hasWifiConnection)
-  {
-    changeMode(BLUETOOTH);
-  }
-  else{
-    connectToChannel(currentRadioChannel);
-  }
 }
 
 void loop()
@@ -183,9 +209,5 @@ void loop()
 
   checkButtons(); // sweeps the buttons for presses
   checkPots();    // sweeps the pots for new values
-
-  if (currentMode == RADIO)
-  {
-    loopRadio();
-  }
+  radio.loop();
 }

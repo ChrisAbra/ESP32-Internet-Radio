@@ -55,10 +55,12 @@ bool disconnectFromWifi()
   {
     return true;
   }
+  wifiManager.disconnect();
   esp_err_t results = esp_wifi_stop();
-  delay(4000);
-  Serial.println("Disconnected");
   hasWifiConnection = false;
+
+  return hasWifiConnection;
+  Serial.println("Disconnected");
   return true;
 
   // directly call to disable the wifi's control of the radio;
@@ -76,10 +78,14 @@ class Radio
 {
 private:
   int _volumePercentage = 100;
+
+  int _targetVolumePercentage = 100; // used for fades;
+
   MODE _currentMode;
 
   Audio _radioAudio;
-  std::string _playingRadioStream;
+  int _playingRadioStreamIndex = -1;
+
   btAudio _bluetoothAudio = btAudio(DEVICE_NAME.c_str());
 
   bool _startBluetooth(bool reconnect = false)
@@ -94,6 +100,7 @@ private:
     if (hasWifiConnection)
     {
       disconnectFromWifi();
+      delay(2000);
     }
 
     Serial.println("Starting bluetooth...");
@@ -113,6 +120,7 @@ private:
   {
     Serial.println("Stopping bluetooth");
     _bluetoothAudio.disconnect();
+    delay(500);
     _bluetoothAudio.end();
     delay(1000);
   }
@@ -140,18 +148,19 @@ private:
 
   void _stopRadio()
   {
-    _playingRadioStream = "";
-
+    _playingRadioStreamIndex = -1;
     _radioAudio.stopSong();
-    i2s_stop((i2s_port_t)_radioAudio.getI2sPort());
+    // i2s_stop((i2s_port_t)_radioAudio.getI2sPort());
+    _currentMode = MODE::OFF;
   }
 
 public:
   Radio() {}
 
-  bool playRadioStream(std::string newChannelStream)
+  bool playRadioStream(int newChannelStreamIndex)
   {
-    if (_playingRadioStream == newChannelStream)
+
+    if (_playingRadioStreamIndex == newChannelStreamIndex)
     {
       Serial.println("Already connected to stream");
       return true;
@@ -168,9 +177,10 @@ public:
     }
 
     Serial.println("Connecting to new stream:");
-    Serial.println(newChannelStream.c_str());
-    bool isConnected = _radioAudio.connecttohost(newChannelStream.c_str());
-    Serial.println(isConnected);
+    Serial.println(CHANNELS[newChannelStreamIndex].c_str());
+    _radioAudio.connecttospeech("Wenn die Hunde schlafen, kann der Wolf gut Schafe stehlen.", "de"); //
+    bool isConnected = _radioAudio.connecttohost(CHANNELS[newChannelStreamIndex].c_str());
+    _playingRadioStreamIndex = newChannelStreamIndex;
     return isConnected;
   }
 
@@ -185,6 +195,9 @@ public:
       _stopRadio();
     }
     _startBluetooth(true);
+    if (_bluetoothAudio.hasClient)
+    {
+    }
   }
 
   void enableBluetoothPairingMode()
@@ -230,6 +243,15 @@ public:
 
   void loop()
   {
+    if (_targetVolumePercentage > _volumePercentage)
+    {
+      setVolume(_volumePercentage++);
+    }
+    else if (_targetVolumePercentage < _volumePercentage)
+    {
+      setVolume(_volumePercentage--);
+    }
+
     if (_currentMode == MODE::RADIO)
     {
       _radioAudio.loop();
@@ -247,11 +269,11 @@ void checkButtons()
 
   if (RADIO_CHANNEL_0_BUTTON.isPressed())
   {
-    radio.playRadioStream(CHANNELS[0]);
+    radio.playRadioStream(0);
   }
   else if (BLUETOOTH_BUTTON.isPressed())
   {
-    radio.playBluetooth();
+    radio.playRadioStream(1);
   }
 }
 
@@ -265,6 +287,7 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("Boot");
+  // connectToWifi();
 
   RADIO_CHANNEL_0_BUTTON.setDebounceTime(100); // set debounce time to 50 milliseconds
   BLUETOOTH_BUTTON.setDebounceTime(100);       // set debounce time to 50 milliseconds

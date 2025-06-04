@@ -4,8 +4,6 @@
 #include <WiFiManager.h>
 #include <ezButton.h>
 
-using namespace std;
-
 // ESP32 I2S digital output pins
 #define I2S_DOUT 25 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
 #define I2S_BCLK 26 // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
@@ -13,7 +11,13 @@ using namespace std;
 
 #define USE_MONO true // Use mono audio
 
-char* DEVICE_NAME = "Rams RT-20 Radio";
+ezButton RADIO_CHANNEL_0_BUTTON = ezButton(18);
+// ezButton RADIO_CHANNEL_1_BUTTON = ezButton(11);
+// ezButton RADIO_CHANNEL_3_BUTTON = ezButton(12);
+// ezButton WIFI_RESET_BUTTON = ezButton(13);
+ezButton BLUETOOTH_BUTTON = ezButton(19);
+
+std::string DEVICE_NAME = "Rams RT-20 Radio";
 
 enum class MODE
 {
@@ -23,78 +27,129 @@ enum class MODE
   INVALID
 };
 
-string CHANNELS[4] = {
+std::string CHANNELS[4] = {
     "https://stream-relay-geo.ntslive.net/stream",
     "https://stream-relay-geo.ntslive.net/stream2",
     "https://stream-relay-geo.ntslive.net/stream3",
     "https://stream-mixtape-geo.ntslive.net/mixtape"};
 
+WiFiManager wifiManager;
+bool hasWifiConnection = false;
+
+bool connectToWifi()
+{
+  if (hasWifiConnection)
+  {
+    return true;
+  }
+  esp_err_t results = esp_wifi_start();
+  wifiManager.setConfigPortalTimeout(180);
+  hasWifiConnection = wifiManager.autoConnect(DEVICE_NAME.c_str());
+  return hasWifiConnection;
+}
+
+bool disconnectFromWifi()
+{
+
+  if (!hasWifiConnection)
+  {
+    return true;
+  }
+  esp_err_t results = esp_wifi_stop();
+  delay(4000);
+  Serial.println("Disconnected");
+  hasWifiConnection = false;
+  return true;
+
+  // directly call to disable the wifi's control of the radio;
+  bool successfultDisconnect = wifiManager.disconnect();
+  if (successfultDisconnect)
+  {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Disconnected");
+    hasWifiConnection = !successfultDisconnect;
+  }
+  return successfultDisconnect;
+}
+
 class Radio
 {
 private:
   int _volumePercentage = 100;
-  char *_accessPointName;
-  WiFiManager _wifiManager;
-  bool _hasWifiConnection;
   MODE _currentMode;
 
   Audio _radioAudio;
-  string _playingRadioStream;
+  std::string _playingRadioStream;
+  btAudio _bluetoothAudio = btAudio(DEVICE_NAME.c_str());
 
-  btAudio _bluetoothAudio = btAudio("ESP32 Bluetooth Device");
-
-  int _BCLK_PIN, _LRC_PIN, _DOUT_PIN;
-
-  void _initialiseBluetooth(bool reconnect = false)
+  bool _startBluetooth(bool reconnect = false)
   {
+
+    if (_currentMode == MODE::BLUETOOTH)
+    {
+      return true;
+    }
+
+    // disconnect the wifi on bluetooth to free the raido;
+    if (hasWifiConnection)
+    {
+      disconnectFromWifi();
+    }
+
+    Serial.println("Starting bluetooth...");
     _bluetoothAudio.begin();
+    Serial.println("Bluetooth stated");
     if (reconnect)
     {
+      Serial.println("Reconnecting to last device...");
       _bluetoothAudio.reconnect(); // Re-connects to last connected device
     }
-    _bluetoothAudio.I2S(_BCLK_PIN, _DOUT_PIN, _LRC_PIN);
+    _bluetoothAudio.I2S(I2S_BCLK, I2S_DOUT, I2S_LRC);
     _bluetoothAudio.volume(_volumePercentage / 100.0f);
     _currentMode = MODE::BLUETOOTH;
+    return true;
   }
   void _stopBluetooth()
   {
     Serial.println("Stopping bluetooth");
+    _bluetoothAudio.disconnect();
+    _bluetoothAudio.end();
+    delay(1000);
   }
 
-  void _startRadio()
+  bool _startRadio()
   {
-    _radioAudio.setPinout(_BCLK_PIN, _LRC_PIN, _DOUT_PIN);
+    if (!connectToWifi())
+    {
+      Serial.println("Failed to connect to wifi");
+      return false;
+    }
+    if (_currentMode == MODE::RADIO)
+    {
+      return true;
+    }
+    _radioAudio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
     _radioAudio.forceMono(USE_MONO); // Force mono for single speaker;
+    _radioAudio.setTone(20, 10, 0);
     _radioAudio.setVolume(_volumePercentage);
     _currentMode = MODE::RADIO;
+
     Serial.println("Starting radio");
+    return true;
   }
 
   void _stopRadio()
   {
-    if (_radioAudio.isRunning())
-    {
-      _radioAudio.stopSong();
-    }
+    _playingRadioStream = "";
+
+    _radioAudio.stopSong();
+    i2s_stop((i2s_port_t)_radioAudio.getI2sPort());
   }
 
 public:
-  Radio(char *accessPointName, int BCLK_PIN, int LRC_PIN, int DOUT_PIN)
-  {
+  Radio() {}
 
-    _BCLK_PIN = BCLK_PIN;
-    _LRC_PIN = LRC_PIN;
-    _DOUT_PIN = DOUT_PIN;
-
-    _currentMode = MODE::OFF;
-    _accessPointName = accessPointName;
-    _bluetoothAudio = btAudio(accessPointName);
-
-    _wifiManager.setConfigPortalTimeout(180);
-    _hasWifiConnection = _wifiManager.autoConnect(accessPointName);
-  }
-
-  bool playRadioStream(string newChannelStream)
+  bool playRadioStream(std::string newChannelStream)
   {
     if (_playingRadioStream == newChannelStream)
     {
@@ -102,21 +157,21 @@ public:
       return true;
     }
 
-    if (!_hasWifiConnection)
-    {
-      Serial.println("Cannot play stream as no valid wifi connection");
-      return false;
-    }
-
     if (_currentMode == MODE::BLUETOOTH)
     {
       _stopBluetooth();
     }
 
-    _startRadio();
+    if (!_startRadio())
+    {
+      return false;
+    }
+
     Serial.println("Connecting to new stream:");
     Serial.println(newChannelStream.c_str());
-    return _radioAudio.connecttohost(newChannelStream.c_str());
+    bool isConnected = _radioAudio.connecttohost(newChannelStream.c_str());
+    Serial.println(isConnected);
+    return isConnected;
   }
 
   void playBluetooth()
@@ -129,7 +184,7 @@ public:
     {
       _stopRadio();
     }
-    _initialiseBluetooth(true);
+    _startBluetooth(true);
   }
 
   void enableBluetoothPairingMode()
@@ -139,17 +194,7 @@ public:
       _bluetoothAudio.disconnect();
       _bluetoothAudio.end();
     }
-    _initialiseBluetooth(false);
-  }
-
-  void enableWifiPairingMode()
-  {
-    _hasWifiConnection = _wifiManager.startConfigPortal(_accessPointName);
-  }
-
-  bool hasWifiConnection()
-  {
-    return _hasWifiConnection;
+    _startBluetooth(false);
   }
 
   void setVolume(int newVolumePercentage)
@@ -193,14 +238,36 @@ public:
   }
 };
 
-void checkButtons() {}
+Radio radio;
 
-void checkPots() {}
+void checkButtons()
+{
+  RADIO_CHANNEL_0_BUTTON.loop();
+  BLUETOOTH_BUTTON.loop();
 
-Radio radio(DEVICE_NAME, I2S_BCLK, I2S_LRC, I2S_DOUT);
+  if (RADIO_CHANNEL_0_BUTTON.isPressed())
+  {
+    radio.playRadioStream(CHANNELS[0]);
+  }
+  else if (BLUETOOTH_BUTTON.isPressed())
+  {
+    radio.playBluetooth();
+  }
+}
+
+void checkPots()
+{
+  // vTaskDelay(1);
+  //  Serial.println("Check Pots");
+}
 
 void setup()
 {
+  Serial.begin(115200);
+  Serial.println("Boot");
+
+  RADIO_CHANNEL_0_BUTTON.setDebounceTime(100); // set debounce time to 50 milliseconds
+  BLUETOOTH_BUTTON.setDebounceTime(100);       // set debounce time to 50 milliseconds
 }
 
 void loop()

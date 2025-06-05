@@ -2,7 +2,13 @@
 #include "Audio.h"
 #include <btAudio.h>
 #include <WiFiManager.h>
-#include <ezButton.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <queue>
+
+#include "OneButton.h"
+#include "ESPmDNS.h"
+#include "SPIFFS.h"
 
 // ESP32 I2S digital output pins
 #define I2S_DOUT 25 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
@@ -11,270 +17,108 @@
 
 #define USE_MONO true // Use mono audio
 
-ezButton RADIO_CHANNEL_0_BUTTON = ezButton(18);
+const char *DEVICE_NAME = "Rams RT-20 Radio";
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+OneButton RADIO_CHANNEL_0_BUTTON = OneButton(18, true, true);
 // ezButton RADIO_CHANNEL_1_BUTTON = ezButton(11);
 // ezButton RADIO_CHANNEL_3_BUTTON = ezButton(12);
 // ezButton WIFI_RESET_BUTTON = ezButton(13);
-ezButton BLUETOOTH_BUTTON = ezButton(19);
+OneButton BLUETOOTH_BUTTON = OneButton(19, true, true);
 
-std::string DEVICE_NAME = "Rams RT-20 Radio";
-
-enum class MODE
-{
-  OFF,
-  BLUETOOTH,
-  RADIO,
-  INVALID
-};
-
-std::string CHANNELS[4] = {
+const std::string CHANNELS[4] = {
     "https://stream-relay-geo.ntslive.net/stream",
     "https://stream-relay-geo.ntslive.net/stream2",
     "https://stream-relay-geo.ntslive.net/stream3",
     "https://stream-mixtape-geo.ntslive.net/mixtape"};
 
+int activeChannel = 0;
+
+enum class PlayType
+{
+  NONE,
+  INTERNET_URL,
+  TTS
+};
+
+struct PlayRequest
+{
+
+  inline bool operator==(const PlayRequest &other)
+  {
+    return (type == other.type && value == other.value);
+  }
+  PlayType type;
+  std::string value;
+  bool isInterruptable()
+  {
+    switch (type)
+    {
+    case PlayType::NONE:
+      return true;
+    case PlayType::TTS:
+      return false;
+    case PlayType::INTERNET_URL:
+      return true;
+    }
+    return true;
+  }
+  bool isTemporary()
+  {
+    switch (type)
+    {
+    case PlayType::NONE:
+      return false;
+    case PlayType::TTS:
+      return true;
+    case PlayType::INTERNET_URL:
+      return false;
+    }
+    return true;
+  }
+
+  PlayRequest()
+  {
+    type = PlayType::NONE;
+  };
+  PlayRequest(PlayType playType, std::string value) : type(playType), value(value) {};
+};
+
+PlayRequest pausePlayRequest = PlayRequest{PlayType::NONE, ""};
+
+PlayRequest activePlayRequest;
+
+queue<PlayRequest> requestQueue;
+
 WiFiManager wifiManager;
 bool hasWifiConnection = false;
 
-bool connectToWifi()
+Audio audio;
+int volumePercentage = 80;
+
+void addToQueue(PlayRequest playRequest)
 {
-  if (hasWifiConnection)
+  if (requestQueue.size() > 0)
   {
-    return true;
+    if (requestQueue.back() == playRequest)
+    {
+      return; // should stop duplicates
+    }
   }
-  esp_err_t results = esp_wifi_start();
-  wifiManager.setConfigPortalTimeout(180);
-  hasWifiConnection = wifiManager.autoConnect(DEVICE_NAME.c_str());
-  return hasWifiConnection;
+  if (playRequest.type != PlayType::NONE && playRequest.value.length() == 0)
+  {
+    return;
+  }
+
+  requestQueue.push(playRequest);
 }
-
-bool disconnectFromWifi()
-{
-
-  if (!hasWifiConnection)
-  {
-    return true;
-  }
-  wifiManager.disconnect();
-  esp_err_t results = esp_wifi_stop();
-  hasWifiConnection = false;
-
-  return hasWifiConnection;
-  Serial.println("Disconnected");
-  return true;
-
-  // directly call to disable the wifi's control of the radio;
-  bool successfultDisconnect = wifiManager.disconnect();
-  if (successfultDisconnect)
-  {
-    WiFi.mode(WIFI_OFF);
-    Serial.println("Disconnected");
-    hasWifiConnection = !successfultDisconnect;
-  }
-  return successfultDisconnect;
-}
-
-class Radio
-{
-private:
-  int _volumePercentage = 100;
-
-  int _targetVolumePercentage = 100; // used for fades;
-
-  MODE _currentMode;
-
-  Audio _radioAudio;
-  int _playingRadioStreamIndex = -1;
-
-  btAudio _bluetoothAudio = btAudio(DEVICE_NAME.c_str());
-
-  bool _startBluetooth(bool reconnect = false)
-  {
-
-    if (_currentMode == MODE::BLUETOOTH)
-    {
-      return true;
-    }
-
-    // disconnect the wifi on bluetooth to free the raido;
-    if (hasWifiConnection)
-    {
-      disconnectFromWifi();
-      delay(2000);
-    }
-
-    Serial.println("Starting bluetooth...");
-    _bluetoothAudio.begin();
-    Serial.println("Bluetooth stated");
-    if (reconnect)
-    {
-      Serial.println("Reconnecting to last device...");
-      _bluetoothAudio.reconnect(); // Re-connects to last connected device
-    }
-    _bluetoothAudio.I2S(I2S_BCLK, I2S_DOUT, I2S_LRC);
-    _bluetoothAudio.volume(_volumePercentage / 100.0f);
-    _currentMode = MODE::BLUETOOTH;
-    return true;
-  }
-  void _stopBluetooth()
-  {
-    Serial.println("Stopping bluetooth");
-    _bluetoothAudio.disconnect();
-    delay(500);
-    _bluetoothAudio.end();
-    delay(1000);
-  }
-
-  bool _startRadio()
-  {
-    if (!connectToWifi())
-    {
-      Serial.println("Failed to connect to wifi");
-      return false;
-    }
-    if (_currentMode == MODE::RADIO)
-    {
-      return true;
-    }
-    _radioAudio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    _radioAudio.forceMono(USE_MONO); // Force mono for single speaker;
-    _radioAudio.setTone(20, 10, 0);
-    _radioAudio.setVolume(_volumePercentage);
-    _currentMode = MODE::RADIO;
-
-    Serial.println("Starting radio");
-    return true;
-  }
-
-  void _stopRadio()
-  {
-    _playingRadioStreamIndex = -1;
-    _radioAudio.stopSong();
-    // i2s_stop((i2s_port_t)_radioAudio.getI2sPort());
-    _currentMode = MODE::OFF;
-  }
-
-public:
-  Radio() {}
-
-  bool playRadioStream(int newChannelStreamIndex)
-  {
-
-    if (_playingRadioStreamIndex == newChannelStreamIndex)
-    {
-      Serial.println("Already connected to stream");
-      return true;
-    }
-
-    if (_currentMode == MODE::BLUETOOTH)
-    {
-      _stopBluetooth();
-    }
-
-    if (!_startRadio())
-    {
-      return false;
-    }
-
-    Serial.println("Connecting to new stream:");
-    Serial.println(CHANNELS[newChannelStreamIndex].c_str());
-    _radioAudio.connecttospeech("Wenn die Hunde schlafen, kann der Wolf gut Schafe stehlen.", "de"); //
-    bool isConnected = _radioAudio.connecttohost(CHANNELS[newChannelStreamIndex].c_str());
-    _playingRadioStreamIndex = newChannelStreamIndex;
-    return isConnected;
-  }
-
-  void playBluetooth()
-  {
-    if (_currentMode == MODE::BLUETOOTH)
-    {
-      return;
-    }
-    if (_currentMode == MODE::RADIO)
-    {
-      _stopRadio();
-    }
-    _startBluetooth(true);
-    if (_bluetoothAudio.hasClient)
-    {
-    }
-  }
-
-  void enableBluetoothPairingMode()
-  {
-    if (_bluetoothAudio.hasClient)
-    {
-      _bluetoothAudio.disconnect();
-      _bluetoothAudio.end();
-    }
-    _startBluetooth(false);
-  }
-
-  void setVolume(int newVolumePercentage)
-  {
-    if (newVolumePercentage == _volumePercentage)
-    {
-      return;
-    }
-    _volumePercentage = newVolumePercentage;
-
-    if (_currentMode == MODE::BLUETOOTH)
-    {
-      _bluetoothAudio.volume(_volumePercentage / 100.0f);
-    }
-    else if (_currentMode == MODE::RADIO)
-    {
-      _radioAudio.setVolume(_volumePercentage);
-    }
-  }
-
-  void stop()
-  {
-    if (_currentMode == MODE::RADIO)
-    {
-      _stopRadio();
-    }
-    else if (_currentMode == MODE::BLUETOOTH)
-    {
-      _stopBluetooth();
-    }
-    _currentMode == MODE::OFF;
-  }
-
-  void loop()
-  {
-    if (_targetVolumePercentage > _volumePercentage)
-    {
-      setVolume(_volumePercentage++);
-    }
-    else if (_targetVolumePercentage < _volumePercentage)
-    {
-      setVolume(_volumePercentage--);
-    }
-
-    if (_currentMode == MODE::RADIO)
-    {
-      _radioAudio.loop();
-    }
-    vTaskDelay(1);
-  }
-};
-
-Radio radio;
 
 void checkButtons()
 {
-  RADIO_CHANNEL_0_BUTTON.loop();
-  BLUETOOTH_BUTTON.loop();
-
-  if (RADIO_CHANNEL_0_BUTTON.isPressed())
-  {
-    radio.playRadioStream(0);
-  }
-  else if (BLUETOOTH_BUTTON.isPressed())
-  {
-    radio.playRadioStream(1);
-  }
+  RADIO_CHANNEL_0_BUTTON.tick();
+  BLUETOOTH_BUTTON.tick();
 }
 
 void checkPots()
@@ -283,20 +127,218 @@ void checkPots()
   //  Serial.println("Check Pots");
 }
 
+std::string indexHtml;
+
+/* void handle_OnConnect()
+{
+
+  Serial.println("Handle request");
+  Serial.println(indexHtml.c_str());
+  server.send(200, "text/html", indexHtml.c_str());
+}
+
+void handle_NotFound()
+{
+  server.send(404, "text/plain", "Not found");
+}
+ */
+
+String processor(const String &var)
+{
+  if (var == "STREAM_URL")
+  {
+    return activePlayRequest.value.c_str();
+  }
+  return String();
+}
+
+void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
+{
+  AwsFrameInfo *info = (AwsFrameInfo *)arg;
+  if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT)
+  {
+    data[len] = 0;
+    std::string message = (char *)data;
+    Serial.println(message.c_str());
+    if (message == "play")
+    {
+      addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]});
+    }
+    else if (message == "pause")
+    {
+      addToQueue(pausePlayRequest);
+    }
+
+  }
+}
+
+void eventHandler(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len)
+{
+  switch (type)
+  {
+  case WS_EVT_CONNECT:
+    Serial.printf("WebSocket client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
+    break;
+  case WS_EVT_DISCONNECT:
+    Serial.printf("WebSocket client #%u disconnected\n", client->id());
+    break;
+  case WS_EVT_DATA:
+    handleWebSocketMessage(arg, data, len);
+    break;
+  case WS_EVT_PONG:
+  case WS_EVT_ERROR:
+    break;
+  }
+}
+
+void setupWebserver()
+{
+  if (!SPIFFS.begin(true))
+  {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+    return;
+  }
+
+  File file = SPIFFS.open("/index.html");
+  if (!file)
+  {
+    Serial.println("Failed to open file for reading");
+    return;
+  }
+  while (file.available())
+  {
+
+    indexHtml += file.read();
+  }
+  file.close();
+
+  if (!MDNS.begin("Rams-RT20"))
+  { // Set the hostname to "Rams-RT20.local"
+    Serial.println("Error setting up MDNS responder!");
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+  Serial.println("mDNS responder started");
+
+  ws.onEvent(eventHandler);
+  server.addHandler(&ws);
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send_P(200, "text/html", indexHtml.c_str(), processor); });
+
+  server.begin();
+}
+
+void setupWifi()
+{
+  wifiManager.setConfigPortalTimeout(180);
+  hasWifiConnection = wifiManager.autoConnect(DEVICE_NAME);
+}
+
+void setupRadio()
+{
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.forceMono(USE_MONO); // Force mono for single speaker;
+  audio.setTone(20, 10, 0);
+  audio.setVolume(volumePercentage);
+
+  RADIO_CHANNEL_0_BUTTON.attachClick([]()
+                                     { 
+                                      activeChannel = 0;
+                                    addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]}); });
+
+  BLUETOOTH_BUTTON.attachClick([]()
+                               { 
+                                activeChannel = 1;
+                                  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]}); });
+}
+
 void setup()
 {
   Serial.begin(115200);
   Serial.println("Boot");
-  // connectToWifi();
 
-  RADIO_CHANNEL_0_BUTTON.setDebounceTime(100); // set debounce time to 50 milliseconds
-  BLUETOOTH_BUTTON.setDebounceTime(100);       // set debounce time to 50 milliseconds
+  setupWifi();
+
+  setupRadio();
+
+  setupWebserver();
+
+  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]});
+}
+
+void pauseRadio()
+{
+  audio.stopSong();
+}
+
+void startTTS()
+{
+  Serial.println("Announcing:");
+  Serial.println(activePlayRequest.value.c_str());
+  audio.connecttospeech(activePlayRequest.value.c_str(), "en");
+}
+void startStream()
+{
+  Serial.println("Starting radio stream at:");
+  Serial.println(activePlayRequest.value.c_str());
+  audio.connecttohost(activePlayRequest.value.c_str());
+}
+
+void checkQueue()
+{
+  if (requestQueue.size() == 0)
+  {
+    return;
+  }
+
+  Serial.println(requestQueue.size());
+
+  if (!audio.isRunning() || activePlayRequest.isInterruptable())
+  {
+
+    PlayRequest nextPlayRequest = requestQueue.front();
+    if (nextPlayRequest.isTemporary())
+    {
+      addToQueue(activePlayRequest);
+    }
+
+    if (activePlayRequest == nextPlayRequest)
+    {
+      Serial.println("SAME PLAY");
+
+      Serial.println(activePlayRequest.value.c_str());
+      Serial.println(nextPlayRequest.value.c_str());
+      requestQueue.pop();
+
+      return;
+    }
+    activePlayRequest = nextPlayRequest;
+
+    if (activePlayRequest.type == PlayType::INTERNET_URL)
+    {
+      startStream();
+    }
+    else if (activePlayRequest.type == PlayType::TTS)
+    {
+      startTTS();
+    }
+    else if (activePlayRequest.type == PlayType::NONE)
+    {
+      pauseRadio();
+    }
+
+  }
 }
 
 void loop()
 {
-
+  ws.cleanupClients();
   checkButtons(); // sweeps the buttons for presses
   checkPots();    // sweeps the pots for new values
-  radio.loop();
+  checkQueue();
+  audio.loop();
+  vTaskDelay(1);
 }

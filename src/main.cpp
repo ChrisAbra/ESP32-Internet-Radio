@@ -1,8 +1,6 @@
 #include "Arduino.h"
 #include "Audio.h"
-#include <btAudio.h>
 #include <WiFiManager.h>
-#include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <queue>
 
@@ -27,14 +25,6 @@ OneButton RADIO_CHANNEL_0_BUTTON = OneButton(18, true, true);
 // ezButton RADIO_CHANNEL_3_BUTTON = ezButton(12);
 // ezButton WIFI_RESET_BUTTON = ezButton(13);
 OneButton BLUETOOTH_BUTTON = OneButton(19, true, true);
-
-const std::string CHANNELS[6] = {
-    "https://stream-relay-geo.ntslive.net/stream",
-    "https://stream-relay-geo.ntslive.net/stream2",
-    "https://stream-mixtape-geo.ntslive.net/mixtape23",
-    "https://stream-mixtape-geo.ntslive.net/mixtape",
-    "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
-    "https://stream-mixtape-geo.ntslive.net/mixtape6"};
 
 std::string activeChannel;
 
@@ -98,7 +88,7 @@ WiFiManager wifiManager;
 bool hasWifiConnection = false;
 
 Audio audio;
-int volume = 10;
+int volume = 8;
 
 void addToQueue(PlayRequest playRequest)
 {
@@ -145,9 +135,9 @@ void webSocketProcessor(std::string message)
 
   else if (message.substr(0, 5) == "play:")
   {
-    std::string channelNumber = message.substr(5, 1);
-    Serial.println(channelNumber.c_str());
-    addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[atoi(channelNumber.c_str())]});
+    std::string channelUrl = message.substr(5, message.length() - 5);
+    Serial.println(channelUrl.c_str());
+    addToQueue(PlayRequest{PlayType::INTERNET_URL, channelUrl});
   }
   else if (message.substr(0, 7) == "volume:")
   {
@@ -266,6 +256,8 @@ void setupRadio()
   */
 }
 
+std::string defaultStream = "https://stream-relay-geo.ntslive.net/stream";
+
 void setup()
 {
   Serial.begin(115200);
@@ -277,7 +269,7 @@ void setup()
 
   setupWebserver();
 
-  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[0]});
+  addToQueue(PlayRequest{PlayType::INTERNET_URL, defaultStream});
 }
 
 void pauseRadio()
@@ -297,7 +289,14 @@ void startStream()
   Serial.println("Starting radio stream at:");
   Serial.println(activePlayRequest.value.c_str());
 
-  audio.connecttohost(activePlayRequest.value.c_str());
+  bool successful = audio.connecttohost(activePlayRequest.value.c_str());
+
+  Serial.printf("success: %u", successful);
+  Serial.println("");
+  Serial.printf("SampleRate: %u", audio.getSampleRate());
+  Serial.println("");
+  Serial.printf("Codec: %s", audio.getCodecname());
+
   activeChannel = activePlayRequest.value;
   ws.textAll(("i:" + activePlayRequest.value).c_str());
 }
@@ -322,12 +321,7 @@ void checkQueue()
 
     if (activePlayRequest == nextPlayRequest)
     {
-      Serial.println("SAME PLAY");
-
-      Serial.println(activePlayRequest.value.c_str());
-      Serial.println(nextPlayRequest.value.c_str());
       requestQueue.pop();
-
       return;
     }
     activePlayRequest = nextPlayRequest;

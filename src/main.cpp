@@ -11,13 +11,13 @@
 #include "SPIFFS.h"
 
 // ESP32 I2S digital output pins
-#define I2S_DOUT 25 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
-#define I2S_BCLK 26 // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
-#define I2S_LRC 27  // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
+#define I2S_BCLK 18 // GPIO 26 (CLOCK Output - serial clock. connects to BCLK pin on  I2S DAC)
+#define I2S_DOUT 17 // GPIO 25 (DATA Output - the digital output. connects to DIN pin on I2S DAC)
+#define I2S_LRC 16  // GPIO 27 (SELECT Output - left/right control. connects to LRC/LCK/WS/WSEL pin on I2S DAC)
 
 #define USE_MONO true // Use mono audio
 
-const char *DEVICE_NAME = "Rams RT-20 Radio";
+const char *DEVICE_NAME = "NTS Radio Reciever";
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -28,13 +28,15 @@ OneButton RADIO_CHANNEL_0_BUTTON = OneButton(18, true, true);
 // ezButton WIFI_RESET_BUTTON = ezButton(13);
 OneButton BLUETOOTH_BUTTON = OneButton(19, true, true);
 
-const std::string CHANNELS[4] = {
+const std::string CHANNELS[6] = {
     "https://stream-relay-geo.ntslive.net/stream",
     "https://stream-relay-geo.ntslive.net/stream2",
-    "https://stream-relay-geo.ntslive.net/stream3",
-    "https://stream-mixtape-geo.ntslive.net/mixtape"};
+    "https://stream-mixtape-geo.ntslive.net/mixtape23",
+    "https://stream-mixtape-geo.ntslive.net/mixtape",
+    "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
+    "https://stream-mixtape-geo.ntslive.net/mixtape6"};
 
-int activeChannel = 0;
+std::string activeChannel;
 
 enum class PlayType
 {
@@ -96,7 +98,7 @@ WiFiManager wifiManager;
 bool hasWifiConnection = false;
 
 Audio audio;
-int volumePercentage = 80;
+int volume = 10;
 
 void addToQueue(PlayRequest playRequest)
 {
@@ -117,8 +119,8 @@ void addToQueue(PlayRequest playRequest)
 
 void checkButtons()
 {
-  RADIO_CHANNEL_0_BUTTON.tick();
-  BLUETOOTH_BUTTON.tick();
+  // RADIO_CHANNEL_0_BUTTON.tick();
+  // BLUETOOTH_BUTTON.tick();
 }
 
 void checkPots()
@@ -129,27 +131,43 @@ void checkPots()
 
 std::string indexHtml;
 
-/* void handle_OnConnect()
+void webSocketProcessor(std::string message)
 {
 
-  Serial.println("Handle request");
-  Serial.println(indexHtml.c_str());
-  server.send(200, "text/html", indexHtml.c_str());
-}
-
-void handle_NotFound()
-{
-  server.send(404, "text/plain", "Not found");
-}
- */
-
-String processor(const String &var)
-{
-  if (var == "STREAM_URL")
+  if (message == "play")
   {
-    return activePlayRequest.value.c_str();
+    addToQueue(PlayRequest{PlayType::INTERNET_URL, activeChannel});
   }
-  return String();
+  else if (message == "pause")
+  {
+    addToQueue(pausePlayRequest);
+  }
+
+  else if (message.substr(0, 5) == "play:")
+  {
+    std::string channelNumber = message.substr(5, 1);
+    Serial.println(channelNumber.c_str());
+    addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[atoi(channelNumber.c_str())]});
+  }
+  else if (message.substr(0, 7) == "volume:")
+  {
+    std::string volumeText = message.substr(7, 2);
+    Serial.println(volumeText.c_str());
+    volume = atoi(volumeText.c_str());
+    audio.setVolume(volume);
+  }
+
+  else if (message == "info")
+  {
+    if (activePlayRequest.type == PlayType::NONE)
+    {
+      ws.textAll("i:paused");
+    }
+    else
+    {
+      ws.textAll(("i:" + activePlayRequest.value).c_str());
+    }
+  }
 }
 
 void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
@@ -160,15 +178,7 @@ void handleWebSocketMessage(void *arg, uint8_t *data, size_t len)
     data[len] = 0;
     std::string message = (char *)data;
     Serial.println(message.c_str());
-    if (message == "play")
-    {
-      addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]});
-    }
-    else if (message == "pause")
-    {
-      addToQueue(pausePlayRequest);
-    }
-
+    webSocketProcessor(message);
   }
 }
 
@@ -181,6 +191,7 @@ void eventHandler(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEvent
     break;
   case WS_EVT_DISCONNECT:
     Serial.printf("WebSocket client #%u disconnected\n", client->id());
+    ws.cleanupClients();
     break;
   case WS_EVT_DATA:
     handleWebSocketMessage(arg, data, len);
@@ -212,7 +223,7 @@ void setupWebserver()
   }
   file.close();
 
-  if (!MDNS.begin("Rams-RT20"))
+  if (!MDNS.begin("radio"))
   { // Set the hostname to "Rams-RT20.local"
     Serial.println("Error setting up MDNS responder!");
     while (1)
@@ -226,7 +237,7 @@ void setupWebserver()
   server.addHandler(&ws);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            { request->send_P(200, "text/html", indexHtml.c_str(), processor); });
+            { request->send(200, "text/html; charset=utf-8", indexHtml.c_str()); });
 
   server.begin();
 }
@@ -241,18 +252,18 @@ void setupRadio()
 {
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
   audio.forceMono(USE_MONO); // Force mono for single speaker;
-  audio.setTone(20, 10, 0);
-  audio.setVolume(volumePercentage);
+  // audio.setTone(20, 10, 0);
+  audio.setVolume(volume);
 
+  /*
   RADIO_CHANNEL_0_BUTTON.attachClick([]()
-                                     { 
-                                      activeChannel = 0;
-                                    addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]}); });
+                                     {
+                                    addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[0]}); });
 
   BLUETOOTH_BUTTON.attachClick([]()
-                               { 
-                                activeChannel = 1;
-                                  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]}); });
+                               {
+                                  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[1]}); });
+  */
 }
 
 void setup()
@@ -266,12 +277,13 @@ void setup()
 
   setupWebserver();
 
-  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[activeChannel]});
+  addToQueue(PlayRequest{PlayType::INTERNET_URL, CHANNELS[0]});
 }
 
 void pauseRadio()
 {
   audio.stopSong();
+  ws.textAll("i:paused");
 }
 
 void startTTS()
@@ -284,7 +296,10 @@ void startStream()
 {
   Serial.println("Starting radio stream at:");
   Serial.println(activePlayRequest.value.c_str());
+
   audio.connecttohost(activePlayRequest.value.c_str());
+  activeChannel = activePlayRequest.value;
+  ws.textAll(("i:" + activePlayRequest.value).c_str());
 }
 
 void checkQueue()
@@ -329,16 +344,16 @@ void checkQueue()
     {
       pauseRadio();
     }
-
   }
 }
 
 void loop()
 {
   ws.cleanupClients();
-  checkButtons(); // sweeps the buttons for presses
-  checkPots();    // sweeps the pots for new values
+  /*   checkButtons(); // sweeps the buttons for presses
+    checkPots();    // sweeps the pots for new values
+   */
   checkQueue();
   audio.loop();
-  vTaskDelay(1);
-}
+/*   vTaskDelay(1);
+ */}
